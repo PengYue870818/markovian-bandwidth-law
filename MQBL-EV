@@ -1,0 +1,354 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+import matplotlib as mpl
+
+HBAR = 1.054571817e-34
+K_B = 1.380649e-23
+M_RB = 1.4431609e-25
+
+OUTDIR = "figs_paper_phase"
+os.makedirs(OUTDIR, exist_ok=True)
+plt.rcParams['figure.constrained_layout.use'] = True
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.size'] = 36
+plt.rcParams['axes.labelsize'] = 36
+plt.rcParams['xtick.labelsize'] = 36
+plt.rcParams['ytick.labelsize'] = 36
+plt.rcParams['mathtext.fontset'] = 'stix'
+
+FIG2C_CSV = "FIG2c.csv"
+N_X_FIG2C = 266
+N_FRAMES_EXPECTED = 218
+
+DOT_RGB = np.array([251,221,133], dtype=float)/255.0
+LINE_RGB = np.array([64,57,144], dtype=float)/255.0
+
+def user_cmap():
+    cols = np.array([[64,57,144],[128,166,226],[251,221,133],[244,111,67],[207,67,62]], dtype=float)/255.0
+    return LinearSegmentedColormap.from_list("user5_continuous", cols, N=256)
+CM_USER = user_cmap()
+
+def read_fig3_csv(csv_path="Fig3.csv"):
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"Fig3 CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path, sep=None, engine="python", skiprows=2, header=None, names=["A_K","v_mps","E_K"])
+    df = df.apply(pd.to_numeric, errors="coerce").dropna(subset=["A_K","v_mps"])
+    return df
+
+def fig2c_lineouts(csv_path=FIG2C_CSV, n_x=N_X_FIG2C, fov_um=1093.0):
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"FIG2c CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path, header=None, sep=None, engine="python")
+    arr = df.values
+    if not np.issubdtype(arr.dtype, np.number):
+        arr = pd.to_numeric(df.stack(), errors="coerce").unstack().values
+    mask_valid_col = ~np.all(~np.isfinite(arr), axis=0)
+    mask_valid_row = ~np.all(~np.isfinite(arr), axis=1)
+    arr = arr[mask_valid_row][:, mask_valid_col]
+    arr = np.nan_to_num(arr, nan=0.0)
+    if arr.ndim != 2:
+        raise ValueError(f"CSV dimensionality invalid: {arr.shape}")
+    if arr.shape[1] == n_x:
+        I = arr.astype(float)
+    elif arr.shape[0] == n_x and arr.shape[1] != n_x:
+        I = arr.T.astype(float)
+    else:
+        raise ValueError(f"CSV shape {arr.shape} cannot match {n_x} points per row")
+    if I.shape[0] != N_FRAMES_EXPECTED:
+        print(f"[WARN] FIG2c CSV has {I.shape[0]} rows, expected {N_FRAMES_EXPECTED}, continuing.")
+    I = np.clip(I, 0.0, None)
+    x_um = np.linspace(-0.5*fov_um, 0.5*fov_um, n_x)
+    tof_s = 22e-3
+    angle_deg = 50.0
+    already_rescaled = True
+    return I, x_um, tof_s, angle_deg, already_rescaled
+
+def F_dimless(omega):
+    omega = np.asarray(omega, dtype=float)
+    return 4.0*(np.sin(0.5*omega)**2)/np.maximum(omega*omega, 1e-300)
+
+def band_edges_single(T_window, lV, sigma_edge, v_eff, Omega_sys=np.inf, c_kappa=np.inf):
+    Om_min = max(1.0/max(T_window,1e-30), abs(v_eff)/max(lV,1e-30))
+    candidates = [Omega_sys, c_kappa/max(T_window,1e-30), abs(v_eff)/max(sigma_edge,1e-30)]
+    candidates = [c for c in candidates if np.isfinite(c) and c>0]
+    Om_max = min(candidates) if len(candidates)>0 else np.nan
+    if not (np.isfinite(Om_max) and Om_max>Om_min):
+        return np.nan, np.nan, np.nan
+    ln_band = np.log(Om_max/Om_min)
+    return Om_min, Om_max, ln_band
+
+def fig2c_p_star(k_sigma=3.0):
+    I, x_um, tof_s, angle_deg, already_rescaled = fig2c_lineouts()
+    I = np.asarray(I, float); x_um = np.asarray(x_um, float)
+    if not already_rescaled:
+        x_um = x_um*np.cos(np.deg2rad(angle_deg))
+    hi = np.quantile(I, 0.999)
+    ok = (np.max(I, axis=1) < hi*0.9999) & (np.sum(I, axis=1) > 0)
+    I = I[ok, :]
+    if I.shape[0] < 3:
+        sigma_x_um = float(np.std(np.sum(I*x_um[None,:], axis=1)/np.maximum(np.sum(I,axis=1),1e-30), ddof=1))
+    else:
+        wsum = np.sum(I, axis=1)
+        mx_um = np.sum(I*x_um[None,:], axis=1)/np.maximum(wsum, 1e-30)
+        t = np.arange(mx_um.size)
+        coef = np.polyfit(t, mx_um, deg=1)
+        resid = mx_um - (coef[0]*t + coef[1])
+        mad = np.median(np.abs(resid - np.median(resid)))
+        sigma_x_um = 1.4826*mad if mad>0 else np.std(resid, ddof=1)
+    sigma_p = M_RB*(sigma_x_um*1e-6)/max(tof_s, 1e-12)
+    p_star = float(k_sigma*sigma_p)
+    return p_star, sigma_x_um, I.shape[0]
+
+def align_and_estimate_n0_from_fig2c():
+    I, x_um, tof_s, angle_deg, already_rescaled = fig2c_lineouts()
+    I = np.asarray(I, float); x_um = np.asarray(x_um, float)
+    if not already_rescaled:
+        x_um = x_um*np.cos(np.deg2rad(angle_deg))
+    hi = np.quantile(I, 0.999)
+    ok = (np.max(I, axis=1) < hi*0.9999) & (np.sum(I, axis=1) > 0)
+    I = I[ok, :]
+    if I.shape[0] == 0:
+        raise RuntimeError("No valid frames in FIG2c after filtering.")
+    wsum = np.sum(I, axis=1)
+    mx_um = np.sum(I*x_um[None,:], axis=1)/np.maximum(wsum, 1e-30)
+    x0_um = np.median(mx_um)
+    J = np.zeros_like(I)
+    for i in range(I.shape[0]):
+        dx = mx_um[i] - x0_um
+        J[i,:] = np.interp(x_um, x_um - dx, I[i,:], left=0.0, right=0.0)
+    n0_x = np.median(J, axis=0)
+    area = np.trapezoid(np.maximum(n0_x,0.0), x_um*1e-6)
+    if np.isfinite(area) and area > 0:
+        n0_x = n0_x / area
+    x_m = x_um*1e-6
+    return x_m, n0_x
+
+def compute_A0_from_n0_and_gaussian_psf(x_m, n0_x, lV, sigmaG):
+    G = np.exp(-0.5*(x_m/sigmaG)**2)
+    norm2 = np.sqrt(np.trapezoid(G*G, x_m))
+    if norm2>0:
+        G = G/norm2
+    In0 = float(np.trapezoid(G*np.maximum(n0_x,0.0), x_m))
+    A0 = (15.0/48.0)*(1.0/np.sqrt(max(lV,1e-30)))*In0
+    return A0, In0, {"sigmaG":sigmaG, "L2norm":True, "Gx":G}
+
+def chi_single_pole_abs(omega, tau_c):
+    return 1.0/np.sqrt(1.0+(omega*tau_c)**2)
+
+def omega_grid_for_v(v, params, Nw=512):
+    T_window = params["T_window"]; lV = params["lV"]; sigma_edge = params["sigma_edge"]
+    omi, oma, lnb = band_edges_single(T_window, lV, sigma_edge, abs(v), Omega_sys=params["Omega_sys"], c_kappa=params["c_kappa"])
+    if not (np.isfinite(omi) and np.isfinite(oma) and oma>omi):
+        return None, (np.nan, np.nan, np.nan)
+    w = np.exp(np.linspace(np.log(omi*T_window), np.log(oma*T_window), Nw))
+    return w, (omi, oma, lnb)
+
+def export_chi_and_gain(v_samples, params, out_csv_spec, out_csv_gain):
+    rows = []
+    vals = []
+    for v in v_samples:
+        w, info = omega_grid_for_v(v, params, Nw=1024)
+        if w is None:
+            vals.append([v, np.nan, np.nan])
+            continue
+        tau_c = params["sigma_edge"]/max(abs(v), 1e-30)
+        chi_abs = chi_single_pole_abs(w, tau_c)
+        lnw = np.log(np.maximum(w,1e-300))
+        J_log = (1.0/(2.0*np.pi)) * np.trapezoid((w*F_dimless(w))*chi_abs, lnw)/(lnw[-1]-lnw[0])
+        vals.append([v, J_log, info[2]])
+        for k in range(w.size):
+            rows.append([v, w[k], F_dimless(w[k]), chi_abs[k]])
+    if rows:
+        pd.DataFrame(rows, columns=["v[m/s]","omega_dimless","F(ω)","|chi(ω)|"]).to_csv(out_csv_spec, index=False)
+    pd.DataFrame(vals, columns=["v[m/s]","J_logavg","ln_band"]).to_csv(out_csv_gain, index=False)
+
+def gaussian_barrier_d3V(x, wV, A_K):
+    A_phys = A_K * K_B
+    V = A_phys * np.exp(-2.0*(x**2)/(wV**2))
+    d3V = (48.0*x/(wV**4) - 64.0*(x**3)/(wV**6)) * V
+    return d3V
+
+def compute_K_slope_and_vector(xA, params, A0):
+    lV = params["lV"]; v_loc = params["v_loc"]; sigmaG = params["sigmaG"]; wV = params.get("wV", lV)
+    xG0 = params.get("xG0", 0.5*wV)
+    T_bath = params["T_bath"]; p_th = np.sqrt(M_RB*K_B*T_bath)
+    C_K = 1.0/(8.0*np.sqrt(np.pi))
+    x_max = 6.0*max(wV, 1e-9)
+    x = np.linspace(-x_max, x_max, 5001)
+    G = np.exp(-0.5*(((x - xG0)/sigmaG)**2))
+    G = G/np.sqrt(np.trapezoid(G*G, x))
+    d3V_unit = gaussian_barrier_d3V(x, wV, 1.0)
+    I_unit = float(np.trapezoid(G * d3V_unit, x))
+    pref = C_K * A0 * (lV**2)/(p_th*max(v_loc,1e-30))
+    K_slope = pref * I_unit
+    K_vec = K_slope * xA
+    pd.DataFrame({"x[m]": x, "G(x-xG0)": G, "d3V_unit[A=1K]": d3V_unit}).to_csv(os.path.join(OUTDIR, "K_integrand_unit.csv"), index=False)
+    pd.DataFrame({"A[K]": xA, "K(A)": K_vec}).to_csv(os.path.join(OUTDIR, "K_vs_A.csv"), index=False)
+    return K_slope, K_vec
+
+def compute_Q_J_lnband(VV, params):
+    T_window = params["T_window"]; lV = params["lV"]; sigma_edge = params["sigma_edge"]
+    Omega_sys = params["Omega_sys"]; c_kappa = params["c_kappa"]; T_bath = params["T_bath"]; vi_max = params["v_i_max"]
+    p_th = np.sqrt(M_RB*K_B*T_bath)
+    eps2 = (HBAR/(max(lV,1e-30)*p_th))**2
+    yV = VV[:,0]
+    v_eff = np.maximum(np.abs(yV), vi_max)
+    ln_band = np.zeros_like(yV)
+    J_vec = np.zeros_like(yV)
+    for i, vv in enumerate(v_eff):
+        omi, oma, lnb = band_edges_single(T_window, lV, sigma_edge, vv, Omega_sys=Omega_sys, c_kappa=c_kappa)
+        ln_band[i] = lnb if np.isfinite(lnb) else np.nan
+        if np.isfinite(lnb) and lnb>0:
+            w = np.exp(np.linspace(np.log(omi*T_window), np.log(oma*T_window), 1024))
+            lnw = np.log(w)
+            tau_c = sigma_edge/max(vv,1e-30)
+            chi_abs = chi_single_pole_abs(w, tau_c)
+            J_vec[i] = (1.0/(2.0*np.pi))*np.trapezoid((w*F_dimless(w))*chi_abs, lnw)/(lnw[-1]-lnw[0])
+        else:
+            J_vec[i] = np.nan
+    return eps2, J_vec, ln_band
+
+def gen_grid_logA_linV(A_lo, A_hi, nA, V_lo, V_hi, nV):
+    xA = np.logspace(np.log10(A_lo), np.log10(A_hi), nA)
+    yV = np.linspace(V_lo, V_hi, nV)
+    AA, VV = np.meshgrid(xA, yV, indexing="xy")
+    return AA, VV, xA, yV
+
+def solve_A_req(q_level, eps2, J_vec, ln_band, K_slope):
+    const_row = eps2 * np.maximum(J_vec,0.0) * np.maximum(ln_band,0.0) * max(K_slope, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        A_req = q_level / np.maximum(const_row, 1e-300)
+    A_req[~np.isfinite(A_req)] = np.nan
+    A_req[A_req<=0] = np.nan
+    return A_req
+
+def _edges_from_centers_log(x):
+    x = np.asarray(x, float)
+    xr = np.zeros(x.size + 1, dtype=float)
+    geom = np.sqrt(x[1:] * x[:-1])
+    xr[1:-1] = geom
+    xr[0] = x[0]**2/geom[0]
+    xr[-1] = x[-1]**2/geom[-1]
+    return xr
+
+def _edges_from_centers_lin(y):
+    y = np.asarray(y, float)
+    yr = np.zeros(y.size + 1, dtype=float)
+    mid = 0.5*(y[1:] + y[:-1])
+    yr[1:-1] = mid
+    yr[0] = y[0] - (mid[0]-y[0])
+    yr[-1] = y[-1] + (y[-1]-mid[-1])
+    return yr
+
+def compute_Q_ratio_map(eps2, J_vec, ln_band, xA, q_thr, K_slope):
+    const_v = eps2 * np.maximum(J_vec,0.0) * np.maximum(ln_band,0.0)
+    R = (const_v[:,None]) * (K_slope * xA[None,:]) / max(q_thr, 1e-300)
+    R[~np.isfinite(R)] = np.nan
+    return R
+
+def plot_single_boundary_with_cloud(xA, yV, A_pts, V_pts, q_level, A_req, A_lo, A_hi, R_map):
+    W_IN = 320.0/25.4
+    H_IN = 240.0/25.4
+    fig, ax = plt.subplots(figsize=(W_IN, H_IN), constrained_layout=True)
+    x_edges = _edges_from_centers_log(xA)
+    y_edges = _edges_from_centers_lin(yV)
+    R_plot = np.copy(R_map)
+    Rmin, Rmax = 1e-2, 1e+2
+    R_plot = np.clip(R_plot, Rmin, Rmax)
+    im = ax.pcolormesh(x_edges, y_edges, R_plot, cmap=CM_USER,
+                       norm=mpl.colors.LogNorm(vmin=Rmin, vmax=Rmax),
+                       shading='auto', alpha=0.85, rasterized=True)
+    try:
+        ax.contour(xA, yV, R_map, levels=[1.0], colors=[LINE_RGB], linewidths=1.2, linestyles='--', alpha=0.9)
+    except Exception:
+        pass
+    if np.any(np.isfinite(A_req)):
+        mask = (A_req >= A_lo) & (A_req <= A_hi) & np.isfinite(A_req)
+        ax.plot(A_req[mask], yV[mask], color=LINE_RGB, lw=3.0, alpha=1.0, zorder=10)
+    if A_pts is not None and V_pts is not None and len(A_pts)>0:
+        ax.scatter(A_pts, V_pts, s=30, c=[DOT_RGB], edgecolors=DOT_RGB, linewidths=0.0, alpha=0.95, zorder=12)
+    ax.set_xscale("log")
+    ax.set_xlim(A_lo, A_hi)
+    ax.set_xlabel("A [K]")
+    ax.set_ylabel("v [m/s]")
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("q / q_thr", fontsize=36, family='Times New Roman')
+    cbar.ax.tick_params(labelsize=36)
+    fig.savefig(os.path.join(OUTDIR, "single_boundary_with_cloud.png"), dpi=280)
+    plt.close(fig)
+
+def main():
+    df = read_fig3_csv("Fig3.csv")
+    A_pts = df["A_K"].values
+    V_pts = df["v_mps"].values
+    params = {
+        "T_window": 5.0e-3,
+        "lV": 90e-6,
+        "sigma_edge": 1.0e-6,
+        "sigmaG": 1.0e-6,
+        "T_bath": 200e-9,
+        "Omega_sys": np.inf,
+        "c_kappa": np.inf,
+        "wV": 90e-6,
+        "v_i_max": 0.022
+    }
+    params["v_loc"] = params["v_i_max"]
+    params["xG0"] = 0.5*params["wV"]
+    p_star, sigma_x_um, n_frames = fig2c_p_star(k_sigma=3.0)
+    p_th = np.sqrt(M_RB*K_B*params["T_bath"])
+    q_thr = float(p_star/np.maximum(p_th,1e-30))
+    x_m, n0_x = align_and_estimate_n0_from_fig2c()
+    A0_used, In0_val, psf_meta = compute_A0_from_n0_and_gaussian_psf(x_m, n0_x, params["lV"], params["sigmaG"])
+    pd.DataFrame({"x[m]": x_m, "n0(x)": n0_x, "G(x)": psf_meta["Gx"]}).to_csv(
+        os.path.join(OUTDIR, "n0_and_G_from_fig2c.csv"), index=False
+    )
+    A_lo, A_hi = 1e-6, 1e-1
+    V_lo = max(np.min(V_pts)*0.7, 1e-4)
+    V_hi = max(np.max(V_pts)*1.3, 0.5)
+    nA, nV = 520, 360
+    AA, VV, xA, yV = gen_grid_logA_linV(A_lo, A_hi, nA, V_lo, V_hi, nV)
+    K_slope, K_vec = compute_K_slope_and_vector(xA, params, A0_used)
+    eps2, J_vec, ln_band = compute_Q_J_lnband(VV, params)
+    A_req = solve_A_req(q_thr, eps2, J_vec, ln_band, K_slope)
+    R_map = compute_Q_ratio_map(eps2, J_vec, ln_band, xA, q_thr, K_slope)
+    plot_single_boundary_with_cloud(xA, yV, A_pts, V_pts, q_thr, A_req, A_lo, A_hi, R_map)
+    pd.DataFrame({"v[m/s]": yV, "A_req[K]": A_req}).to_csv(
+        os.path.join(OUTDIR, "single_boundary_points.csv"), index=False
+    )
+    v_samples = np.linspace(V_lo, V_hi, 64)
+    export_chi_and_gain(v_samples, params,
+                        os.path.join(OUTDIR, "chi_spectra_samples.csv"),
+                        os.path.join(OUTDIR, "chi_band_avg_vs_v.csv"))
+    meta = {
+        "A0_used": A0_used,
+        "In0_val": In0_val,
+        "A0_from_fig2c": True,
+        "sigmaG[m]": params["sigmaG"],
+        "wV[m]": params["wV"],
+        "xG0[m]": params["xG0"],
+        "K_slope": K_slope,
+        "T_window[s]": params["T_window"],
+        "lV[m]": params["lV"],
+        "sigma_edge[m]": params["sigma_edge"],
+        "vi_max_used[m/s]": params["v_i_max"],
+        "v_loc[m/s]": params["v_loc"],
+        "T_bath[K]": params["T_bath"],
+        "p_star[kg m/s]": p_star,
+        "p_th[kg m/s]": p_th,
+        "q_thr": q_thr,
+        "N_frames_used": int(n_frames),
+        "sigma_x_um": sigma_x_um
+    }
+    pd.DataFrame(list(meta.items()), columns=["name","value"]).to_csv(os.path.join(OUTDIR, "run_meta.csv"), index=False)
+    pd.DataFrame({"v[m/s]": yV, "J": J_vec, "ln_band": ln_band}).to_csv(
+        os.path.join(OUTDIR, "J_lnband_vs_v.csv"), index=False
+    )
+    print(OUTDIR)
+    if np.any(np.isfinite(A_req)):
+        print("K_slope =", K_slope, " | A_req[min,max] =", np.nanmin(A_req), np.nanmax(A_req))
+
+if __name__ == "__main__":
+    main()
